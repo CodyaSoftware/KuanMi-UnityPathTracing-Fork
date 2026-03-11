@@ -5,7 +5,7 @@ RWStructuredBuffer<uint64_t> gInOut_SharcHashEntriesBuffer;
 RWStructuredBuffer<SharcAccumulationData> gInOut_SharcAccumulated;
 RWStructuredBuffer<SharcPackedData> gInOut_SharcResolved;
 
-#define RTXCR_INTEGRATION 0
+#define RTXCR_INTEGRATION 1
 
 #if( USE_STOCHASTIC_SAMPLING == 1 )
 #define TEX_SAMPLER gNearestMipmapNearestSampler
@@ -17,6 +17,16 @@ RWStructuredBuffer<SharcPackedData> gInOut_SharcResolved;
 #define SAMPLE( coords ) Load( int3( coords ) )
 #else
 #define SAMPLE( coords ) SampleLevel( TEX_SAMPLER, coords.xy, coords.z )
+#endif
+
+#if( RTXCR_INTEGRATION == 1 )
+// Required by RTXCR
+float luminance( float3 x )
+{
+    return Color::Luminance( x );
+}
+#include "../rtxcr/HairFarFieldBCSDF.hlsli"
+#include "../rtxcr/SubsurfaceScattering.hlsli"
 #endif
 
 float3x3 Hair_GetBasis(float3 N, float3 T)
@@ -201,6 +211,7 @@ float3 GetLighting(GeometryProps geometryProps, MaterialProps materialProps, uin
 
     // Lighting
     Xshadow = geometryProps.X;
+    GeometryProps shadowGeomProps = geometryProps; // tracks which point to cast shadow from; updated to SSS exit when SSS succeeds
 
     if ((flags & LIGHTING) != 0)
     {
@@ -208,7 +219,7 @@ float3 GetLighting(GeometryProps geometryProps, MaterialProps materialProps, uin
         float3 Csky = GetSkyIntensity(-geometryProps.V);
         float NoL = saturate(dot(geometryProps.N, gSunDirection.xyz));
         bool isSSS = (flags & SSS) != 0 && geometryProps.Has(FLAG_SKIN);
-        float minThreshold = isSSS ? -0.2 : 0.03; // TODO: hand-tuned for SSS, a helper in RTXCR SDK is needed
+        float minThreshold = isSSS ? gSssMinThreshold : 0.03;
         float shadow = Math::SmoothStep(minThreshold, 0.1, NoL);
 
         // COMMON MATERIAL
@@ -243,6 +254,41 @@ float3 GetLighting(GeometryProps geometryProps, MaterialProps materialProps, uin
 
             lighting = Cspec * Cimp;
 
+#if( RTXCR_INTEGRATION == 1 )
+            if (isSSS)
+            {
+                RTXCR_SubsurfaceMaterialData sssMat = (RTXCR_SubsurfaceMaterialData)0;
+                sssMat.transmissionColor = albedo;
+                sssMat.scatteringColor = gSssScatteringColor;
+                sssMat.scale = gSssScale / gUnitToMetersMultiplier;
+                sssMat.g = 0.0;
+
+                float3 Xoff = geometryProps.GetXoffset(geometryProps.N, PT_SHADOW_RAY_OFFSET);
+                float3x3 basis = Geometry::GetBasis(geometryProps.N);
+                RTXCR_SubsurfaceInteraction sssInteraction =
+                    RTXCR_CreateSubsurfaceInteraction(Xoff, basis[2], basis[0], basis[1]);
+
+                RTXCR_SubsurfaceSample sssSample = (RTXCR_SubsurfaceSample)0;
+                RTXCR_EvalBurleyDiffusionProfile(sssMat, sssInteraction,
+                    gSssMaxSampleRadius / gUnitToMetersMultiplier, false, Rng::Hash::GetFloat2(), sssSample);
+
+                float2 mipConeSSS = GetConeAngleFromRoughness(geometryProps.mip, 0.0);
+                GeometryProps sssProps;
+                MaterialProps sssMaterialProps;
+                CastRay(sssSample.samplePosition, -sssInteraction.normal,
+                        0.0, INF, mipConeSSS, FLAG_NON_TRANSPARENT, sssProps, sssMaterialProps);
+
+                if (!sssProps.IsMiss() && sssProps.Has(FLAG_SKIN))
+                {
+                    Xshadow = sssProps.X;
+                    shadowGeomProps = sssProps; // shadow ray will now test visibility from the scatter exit point
+                    float NoL_sss = saturate(dot(sssMaterialProps.N, L));
+                    Cdiff = RTXCR_EvalBssrdf(sssSample, Csun, NoL_sss);
+                }
+                // Cdiff = float3(1.0, 0, 0.1);
+            }
+#endif
+
             lighting += Cdiff * (1.0 - F);
             lighting *= shadow;
         }
@@ -261,10 +307,10 @@ float3 GetLighting(GeometryProps geometryProps, MaterialProps materialProps, uin
         rnd *= gTanSunAngularRadius;
 
         float3 sunDirection = normalize(gSunBasisX.xyz * rnd.x + gSunBasisY.xyz * rnd.y + gSunDirection.xyz);
-        float2 mipAndCone = GetConeAngleFromAngularRadius(geometryProps.mip, gTanSunAngularRadius);
+        float2 mipAndCone = GetConeAngleFromAngularRadius(shadowGeomProps.mip, gTanSunAngularRadius);
 
         
-        Xshadow = geometryProps.GetXoffset(sunDirection,PT_SHADOW_RAY_OFFSET);
+        Xshadow = shadowGeomProps.GetXoffset(sunDirection,PT_SHADOW_RAY_OFFSET);
         float hitT = CastVisibilityRay_AnyHit(Xshadow, sunDirection, 0.0, INF, mipAndCone, gWorldTlas, instanceInclusionMask, rayFlags);
         lighting *= float(hitT == INF);
     }
@@ -304,21 +350,21 @@ float3 GenerateRayAndUpdateThroughput(inout GeometryProps geometryProps, inout M
     {
         // Generate a ray in local space
         float3 candidateRayLocal;
-        #if( RTXCR_INTEGRATION == 1 )
-        if (isHair)
-        {
-            float2 rand[2] = {Rng::Hash::GetFloat2(), Rng::Hash::GetFloat2()};
-
-            float3 specular = 0.0;
-            float3 diffuse = 0.0;
-            float pdf = 0.0;
-
-            RTXCR_HairInteractionSurface hairSurface = Hair_GetSurface(Vlocal);
-            RTXCR_HairMaterialInteractionBcsdf hairMaterial = Hair_GetMaterial();
-            RTXCR_SampleFarFieldBcsdf(hairSurface, hairMaterial, Vlocal, 2.0 * rnd.x - 1.0, rnd.y, rand, candidateRayLocal, specular, diffuse, pdf);
-        }
-        else
-        #endif
+        // #if( RTXCR_INTEGRATION == 1 )
+        // if (isHair)
+        // {
+        //     float2 rand[2] = {Rng::Hash::GetFloat2(), Rng::Hash::GetFloat2()};
+        //
+        //     float3 specular = 0.0;
+        //     float3 diffuse = 0.0;
+        //     float pdf = 0.0;
+        //
+        //     RTXCR_HairInteractionSurface hairSurface = Hair_GetSurface(Vlocal);
+        //     RTXCR_HairMaterialInteractionBcsdf hairMaterial = Hair_GetMaterial();
+        //     RTXCR_SampleFarFieldBcsdf(hairSurface, hairMaterial, Vlocal, 2.0 * rnd.x - 1.0, rnd.y, rand, candidateRayLocal, specular, diffuse, pdf);
+        // }
+        // else
+        // #endif
         if (isDiffuse)
             candidateRayLocal = ImportanceSampling::Cosine::GetRay(rnd);
         else
@@ -375,21 +421,21 @@ float3 GenerateRayAndUpdateThroughput(inout GeometryProps geometryProps, inout M
     float NoL = saturate(dot(Nlocal, rayLocal));
     float VoH = abs(dot(Vlocal, Hlocal));
 
-    #if( RTXCR_INTEGRATION == 1 )
-    if (isHair)
-    {
-        float3 specular = 0.0;
-        float3 diffuse = 0.0;
-        float pdf = 0.0;
-
-        RTXCR_HairInteractionSurface hairGeometry = Hair_GetSurface(Vlocal);
-        RTXCR_HairMaterialInteractionBcsdf hairMaterial = Hair_GetMaterial();
-        RTXCR_HairFarFieldBcsdfEval(hairGeometry, hairMaterial, rayLocal, Vlocal, specular, diffuse, pdf);
-
-        throughput *= pdf > 0.0 ? (specular + diffuse) / pdf : 0.0;
-    }
-    else
-    #endif
+    // #if( RTXCR_INTEGRATION == 1 )
+    // if (isHair)
+    // {
+    //     float3 specular = 0.0;
+    //     float3 diffuse = 0.0;
+    //     float pdf = 0.0;
+    //
+    //     RTXCR_HairInteractionSurface hairGeometry = Hair_GetSurface(Vlocal);
+    //     RTXCR_HairMaterialInteractionBcsdf hairMaterial = Hair_GetMaterial();
+    //     RTXCR_HairFarFieldBcsdfEval(hairGeometry, hairMaterial, rayLocal, Vlocal, specular, diffuse, pdf);
+    //
+    //     throughput *= pdf > 0.0 ? (specular + diffuse) / pdf : 0.0;
+    // }
+    // else
+    // #endif
     if (isDiffuse)
     {
         float NoV = abs(dot(Nlocal, Vlocal));

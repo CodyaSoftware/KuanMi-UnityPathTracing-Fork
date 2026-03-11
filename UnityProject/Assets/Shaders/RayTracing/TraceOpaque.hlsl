@@ -687,7 +687,7 @@ void MainRayGenShader()
 
     // Direct lighting
     // float3 Xshadow;
-    float3 Ldirect = GetLighting(geometryProps0, materialProps0, LIGHTING | SHADOW);
+    float3 Ldirect = GetLighting(geometryProps0, materialProps0, LIGHTING | SHADOW | SSS);
 
     if (gOnScreen == SHOW_INSTANCE_INDEX)
     {

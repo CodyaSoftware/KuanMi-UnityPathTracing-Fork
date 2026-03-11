@@ -167,6 +167,7 @@ Shader "Custom/LitWithRayTracing"
             #pragma shader_feature_local_raytracing _NORMALMAP
             #pragma shader_feature_local_raytracing _METALLICSPECGLOSSMAP
             #pragma shader_feature_local_raytracing _SURFACE_TYPE_TRANSPARENT
+            #pragma shader_feature_local_raytracing _SKIN
 
             #pragma multi_compile_local RAY_TRACING_PROCEDURAL_GEOMETRY
 
@@ -432,6 +433,12 @@ Shader "Custom/LitWithRayTracing"
                 #if  _SURFACE_TYPE_TRANSPARENT
                 flag = FLAG_TRANSPARENT;
                 #endif
+                
+                #if _SKIN
+                flag |= FLAG_SKIN;
+                #endif
+                
+                
                 payload.SetFlag(flag);
             }
             ENDHLSL
