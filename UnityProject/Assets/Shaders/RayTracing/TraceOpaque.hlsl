@@ -144,6 +144,8 @@ TraceOpaqueResult TraceOpaque(GeometryProps geometryProps0, MaterialProps materi
     result.specHitDist = NRD_FrontEnd_SpecHitDistAveraging_Begin();
     #endif
 
+    // viewZ0 and NRD demodulation factors MUST use the original primary surface
+    // so that they match the G-Buffer written in MainRayGenShader.
     float viewZ0 = Geometry::AffineTransform(gWorldToView, geometryProps0.X).z;
     float roughness0 = materialProps0.roughness;
 
@@ -162,6 +164,64 @@ TraceOpaqueResult TraceOpaque(GeometryProps geometryProps0, MaterialProps materi
             specFactor0 = 1.0;
         }
     }
+
+    // SSS exit point pre-computation for diffuse indirect illumination.
+    // Specular paths always trace from the original primary vertex (SSS is a diffuse-only phenomenon).
+    // The swap is deferred into the per-path loop at bounce == 1 after isDiffuse is determined.
+    //
+    // Energy balance: bssrdfWeight already contains entry albedo (transmissionColor).
+    // GenerateRayAndUpdateThroughput will multiply exit albedo back in, so we pre-divide
+    // bssrdfWeight by entry albedo here to avoid double-counting (assumes entry ≈ exit for skin).
+    bool isSSSActive = false;
+    GeometryProps sssGeometryProps = geometryProps0;
+    MaterialProps sssMaterialProps0 = materialProps0;
+    float3 sssWeight = 1.0;
+#if( RTXCR_INTEGRATION == 1 )
+    if (geometryProps0.Has(FLAG_SKIN) && !geometryProps0.IsMiss())
+    {
+        float3 entryAlbedo, entryRf0;
+        BRDF::ConvertBaseColorMetalnessToAlbedoRf0(materialProps0.baseColor, materialProps0.metalness, entryAlbedo, entryRf0);
+
+        RTXCR_SubsurfaceMaterialData sssMat = (RTXCR_SubsurfaceMaterialData)0;
+        sssMat.transmissionColor = entryAlbedo;
+        sssMat.scatteringColor   = gSssScatteringColor;
+        sssMat.scale             = gSssScale / gUnitToMetersMultiplier;
+        sssMat.g                 = 0.0;
+
+        float3 Xoff = geometryProps0.GetXoffset(geometryProps0.N, PT_SHADOW_RAY_OFFSET);
+        float3x3 basis = Geometry::GetBasis(geometryProps0.N);
+        RTXCR_SubsurfaceInteraction sssInteraction =
+            RTXCR_CreateSubsurfaceInteraction(Xoff, basis[2], basis[0], basis[1]);
+
+        RTXCR_SubsurfaceSample sssSampleIndirect = (RTXCR_SubsurfaceSample)0;
+        RTXCR_EvalBurleyDiffusionProfile(sssMat, sssInteraction,
+            gSssMaxSampleRadius / gUnitToMetersMultiplier, true, Rng::Hash::GetFloat2(), sssSampleIndirect);
+
+        float2 mipConeSSS = GetConeAngleFromRoughness(geometryProps0.mip, 0.0);
+        GeometryProps sssHitProps;
+        MaterialProps sssHitMaterialProps;
+        CastRay(sssSampleIndirect.samplePosition, -sssInteraction.normal,
+                0.0, INF, mipConeSSS, FLAG_NON_TRANSPARENT, sssHitProps, sssHitMaterialProps);
+
+        if (!sssHitProps.IsMiss() && sssHitProps.Has(FLAG_SKIN))
+        {
+            // CastRay sets V = -rayDir = +normal (pointing into the surface).
+            // Restore the camera-facing view direction so that Fresnel / diffuse BRDF
+            // evaluation at the exit point uses the correct outgoing direction.
+            sssHitProps.V = geometryProps0.V;
+
+            sssGeometryProps  = sssHitProps;
+            sssMaterialProps0 = sssHitMaterialProps;
+
+            // Divide out entry albedo so GenerateRayAndUpdateThroughput's albedo
+            // multiplication at bounce == 1 does not double-count it.
+            sssWeight = sssSampleIndirect.bssrdfWeight / (entryAlbedo);
+            
+            sssWeight /= (entryAlbedo);
+            isSSSActive = true;
+        }
+    }
+#endif
 
 
     // SHARC debug visualization
@@ -256,6 +316,17 @@ TraceOpaqueResult TraceOpaque(GeometryProps geometryProps0, MaterialProps materi
                 // This is not needed in case of "RESOLUTION_FULL_PROBABILISTIC", since hair doesn't have diffuse component
                 if (geometryProps.Has(FLAG_HAIR) && isDiffuse)
                     break;
+
+                // SSS vertex substitution: diffuse-only, first bounce only.
+                // Specular paths remain at the original primary surface.
+#if( RTXCR_INTEGRATION == 1 )
+                if (bounce == 1 && isDiffuse && isSSSActive)
+                {
+                    geometryProps  = sssGeometryProps;
+                    materialProps  = sssMaterialProps0;
+                    pathThroughput *= sssWeight;
+                }
+#endif
 
                 // Importance sampling
                 uint sampleMaxNum = 0;

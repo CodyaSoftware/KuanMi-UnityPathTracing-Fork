@@ -69,6 +69,8 @@ Shader "Custom/Fabric"
             #include "Assets/Shaders/Include/ml.hlsli"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 
+            #pragma shader_feature_local_raytracing _SKIN
+            
             // ------------------------------------------------------------
             // 材质 CBuffer —— 名称与 AVP_Fabric ShaderGraph 生成代码完全匹配
             // ------------------------------------------------------------
@@ -359,7 +361,19 @@ Shader "Custom/Fabric"
                 
                 uint instanceIndex = InstanceIndex();
                 payload.SetInstanceIndex(instanceIndex);
-                payload.SetFlag(FLAG_NON_TRANSPARENT);
+                
+                
+                uint flag = FLAG_NON_TRANSPARENT;
+                #if  _SURFACE_TYPE_TRANSPARENT
+                flag = FLAG_TRANSPARENT;
+                #endif
+                
+                #if _SKIN
+                flag |= FLAG_SKIN;
+                #endif
+                
+                
+                payload.SetFlag(flag);
             }
             ENDHLSL
         }
