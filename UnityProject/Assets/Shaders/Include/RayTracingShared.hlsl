@@ -178,8 +178,12 @@ void CastRay(float3 origin, float3 direction, float Tmin, float Tmax, float2 mip
     props.T = payload.T;
     props.X = origin + direction * payload.hitT;
 
-    // props.Xprev = payload.X;
     props.Xprev = payload.Xprev;
+    #if NOT_USE_PREV
+    props.Xprev = props.X;
+    #endif
+    props.Xprev = props.X;
+    
     props.V = -direction;
     props.textureOffsetAndFlags = payload.instanceIndexAndFlags;
 
@@ -270,7 +274,7 @@ float3 GetLighting(GeometryProps geometryProps, MaterialProps materialProps, uin
 
                 RTXCR_SubsurfaceSample sssSample = (RTXCR_SubsurfaceSample)0;
                 RTXCR_EvalBurleyDiffusionProfile(sssMat, sssInteraction,
-                    gSssMaxSampleRadius / gUnitToMetersMultiplier, false, Rng::Hash::GetFloat2(), sssSample);
+                    gSssMaxSampleRadius / gUnitToMetersMultiplier, true, Rng::Hash::GetFloat2(), sssSample);
 
                 float2 mipConeSSS = GetConeAngleFromRoughness(geometryProps.mip, 0.0);
                 GeometryProps sssProps;
